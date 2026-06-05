@@ -7,7 +7,7 @@ import os
 import re
 import sys
 import typing
-from collections import defaultdict
+from collections import Counter, defaultdict
 from construct import this, Container, ListContainer, Struct, Switch, Array, Bytes, GreedyBytes, GreedyRange, FocusedSeq, Pass, Padded, Padding, Prefixed, Flag, Byte, Int16ul, Int32ul, Int64ul, Terminated
 from dataclasses import dataclass
 from functools import cached_property, partial
@@ -851,12 +851,17 @@ class TplgGraph:
                 tails.add(node)
         return isolated, heads, tails
 
-    def __init__(self, grouped_tplg: GroupedTplg):
+    def __init__(
+        self,
+        grouped_tplg: GroupedTplg,
+        merged_node_sources: typing.Optional["dict[str, set[str]]"] = None,
+    ):
         "Build graph from grouped topology data."
         self.errors = 0 # non fatal errors
         self.show_core = 'auto'
         self.without_nodeinfo = False
         self._tplg = grouped_tplg
+        self._merged_node_sources = merged_node_sources or {}
         self._nodes_dict = TplgGraph._build_nodes_dict(grouped_tplg.widget_list)
         self._nodes_names_in_graph = TplgGraph._build_nodes_names_in_graph(grouped_tplg.graph_list, self._nodes_dict)
         self._forward_edges, self._backward_edges = TplgGraph._build_edges(grouped_tplg.graph_list)
@@ -964,6 +969,17 @@ class TplgGraph:
         if GroupedTplg.is_virtual_widget(widget):
             attr['style'] = "dotted"
             attr['color'] = 'blue'
+
+        source_labels = self._merged_node_sources.get(name)
+        if source_labels:
+            source_text = ','.join(sorted(source_labels))
+            label_prefix = 'connect' if len(source_labels) > 1 else 'from'
+            sublabel2 += f'<BR ALIGN="CENTER"/><SUB>{label_prefix}: {source_text}</SUB>'
+            attr['label'] = f'<{display_name}{sublabel}{sublabel2}>'
+            if len(source_labels) > 1:
+                # Make merge-collision nodes stand out in merged graphs.
+                attr['color'] = 'crimson'
+                attr['penwidth'] = '2'
         return attr
 
     def _display_edge_attr(self, edge: Container):
@@ -1307,6 +1323,49 @@ def has_wname_prefix(widget):
     # Double-negation: "no_wname false" => prefix
     return not no_wname_prefix
 
+def _find_duplicates(values) -> "list[typing.Any]":
+    "Return sorted values that appear more than once."
+    return sorted([value for value, count in Counter(values).items() if count > 1])
+
+def collect_graph_name_sources(
+    tplg: GroupedTplg,
+    source_label: str,
+    acc: typing.Optional["dict[str, set[str]]"] = None,
+) -> "dict[str, set[str]]":
+    "Collect graph node names and map each node name to source topology labels."
+    if acc is None:
+        acc = defaultdict(set)
+
+    for widget in tplg.widget_list:
+        acc[widget["widget"]["name"]].add(source_label)
+        sname = widget["widget"]["sname"]
+        if sname:
+            acc[sname].add(source_label)
+
+    for edge in tplg.graph_list:
+        acc[edge["source"]].add(source_label)
+        acc[edge["sink"]].add(source_label)
+
+    return acc
+
+def get_merge_duplicate_warnings(tplg: GroupedTplg) -> "list[str]":
+    "Return warning messages for likely conflicts in merged topologies." 
+    warnings = []
+
+    dup_widget_names = _find_duplicates(widget["widget"]["name"] for widget in tplg.widget_list)
+    if dup_widget_names:
+        warnings.append(f"duplicate widget names found: {dup_widget_names}")
+
+    dup_pcm_ids = _find_duplicates(pcm["pcm_id"] for pcm in tplg.pcm_list)
+    if dup_pcm_ids:
+        warnings.append(f"duplicate PCM IDs found: {dup_pcm_ids}")
+
+    dup_pcm_names = _find_duplicates(pcm["pcm_name"] for pcm in tplg.pcm_list)
+    if dup_pcm_names:
+        warnings.append(f"duplicate PCM names found: {dup_pcm_names}")
+
+    return warnings
+
 
 if __name__ == "__main__":
     from pathlib import Path
@@ -1323,6 +1382,8 @@ Enables internal globbing mode: the single positional argument is not a file but
             'if multiple information types are wanted, use "," to separate them, eg, `-d pcm,graph`')
         parser.add_argument('filenames', nargs='+', type=str, help="""topology filenames or single pattern argument depending on
 --tplgroot, see below. To pass multiple patterns use "," to separate them.""")
+        parser.add_argument('-m', '--merge', action='store_true',
+            help='merge multiple input topology files into one combined topology before dumping/graphing')
         # The below options are used to control generated graph
         parser.add_argument('-D', '--directory', type=str, default=".", help="output directory for generated graph")
         parser.add_argument('-F', '--format', type=str, default="png", help="output format for generated graph, defaults to 'png'."
@@ -1395,17 +1456,42 @@ considered different from components that specific core ID 0.
             files = [ Path(f) for f in cmd_args.filenames ]
 
         errors = 0
-        for f in files:
-            tplg = GroupedTplg(tplgFormat.parse_file(f))
-            assert set(dump_types) <= set(supported_dump), f"unsupported type in {dump_types}"
+        assert set(dump_types) <= set(supported_dump), f"unsupported type in {dump_types}"
+
+        if cmd_args.merge:
+            merged_raw_tplg = []
+            merged_node_sources = defaultdict(set)
+            for f in files:
+                raw_tplg = tplgFormat.parse_file(f)
+                merged_raw_tplg.extend(raw_tplg)
+                per_file_tplg = GroupedTplg(raw_tplg)
+                collect_graph_name_sources(per_file_tplg, f.name, merged_node_sources)
+
+            tplg = GroupedTplg(merged_raw_tplg)
+            for warning in get_merge_duplicate_warnings(tplg):
+                print(f"WARNING: {warning}", file=sys.stderr)
+
             if 'pcm' in dump_types:
                 tplg.print_pcm_info()
             if 'graph' in dump_types:
-                graph = TplgGraph(tplg)
+                graph = TplgGraph(tplg, merged_node_sources=merged_node_sources)
                 graph.show_core = cmd_args.show_core
                 graph.without_nodeinfo = cmd_args.without_nodeinfo
-                graph.draw(f.stem, outdir=cmd_args.directory, file_format=cmd_args.format, live_view=cmd_args.live_view)
+                graph_name = f"merged_{len(files)}_tplgs"
+                graph.draw(graph_name, outdir=cmd_args.directory, file_format=cmd_args.format,
+                    live_view=cmd_args.live_view)
                 errors += graph.errors
+        else:
+            for f in files:
+                tplg = GroupedTplg(tplgFormat.parse_file(f))
+                if 'pcm' in dump_types:
+                    tplg.print_pcm_info()
+                if 'graph' in dump_types:
+                    graph = TplgGraph(tplg)
+                    graph.show_core = cmd_args.show_core
+                    graph.without_nodeinfo = cmd_args.without_nodeinfo
+                    graph.draw(f.stem, outdir=cmd_args.directory, file_format=cmd_args.format, live_view=cmd_args.live_view)
+                    errors += graph.errors
 
         return errors
 

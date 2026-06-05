@@ -88,6 +88,14 @@ $ ./tools/sof-dump-status.py -p
 apl
 ```
 
+Example: merge multiple topology files for a single PCM/graph view
+```
+$ ./tools/tplgtool2.py --merge -d pcm,graph -D /tmp/ \
+  /path/to/function.tplg /path/to/feature.tplg
+```
+This writes a single merged graph (for example, `merged_2_tplgs.png`) and prints
+duplicate warnings in merge mode when widget names, PCM IDs, or PCM names collide.
+
 ### test case result
 | exit code | display | description            |
 | --------- | ------- | ---------------------- |
