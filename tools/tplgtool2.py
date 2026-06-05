@@ -787,7 +787,11 @@ class TplgGraph:
         names = {}
         for edge in graph_list:
             for ename in [edge["source"], edge["sink"]]:
-                node = nodes_dict[ename]
+                node = nodes_dict.get(ename)
+                if node is None:
+                    # Some feature topologies reference graph endpoints not present in
+                    # DAPM widgets. Keep these endpoints as-is instead of failing.
+                    continue
                 for name in [node["widget"]["name"], node["widget"]["sname"]]:
                     if name != ename:
                         names[name] = ename
@@ -810,6 +814,17 @@ class TplgGraph:
             forward_edge[edge["source"]].append(edge["sink"])
             backward_edge[edge["sink"]].append(edge["source"])
         return forward_edge, backward_edge
+
+    @staticmethod
+    def _build_unknown_nodes(graph_list: "list[Container]", nodes_dict: "dict[str, Container]") -> "set[str]":
+        "Collect graph nodes that do not map to any widget name/sname."
+        unknown = set()
+        for edge in graph_list:
+            if edge["source"] not in nodes_dict:
+                unknown.add(edge["source"])
+            if edge["sink"] not in nodes_dict:
+                unknown.add(edge["sink"])
+        return unknown
 
     @staticmethod
     def _build_leaves(node_names: "list[str]", forward_edges: "dict[str, list[str]]", backward_edges: "dict[str, list[str]]") -> "tuple[set[str], set[str], set[str]]":
@@ -845,6 +860,10 @@ class TplgGraph:
         self._nodes_dict = TplgGraph._build_nodes_dict(grouped_tplg.widget_list)
         self._nodes_names_in_graph = TplgGraph._build_nodes_names_in_graph(grouped_tplg.graph_list, self._nodes_dict)
         self._forward_edges, self._backward_edges = TplgGraph._build_edges(grouped_tplg.graph_list)
+        self._unknown_nodes = TplgGraph._build_unknown_nodes(grouped_tplg.graph_list, self._nodes_dict)
+        if self._unknown_nodes:
+            unknown_nodes = ", ".join(sorted(self._unknown_nodes))
+            print(f"WARNING: graph-only node(s) without matching widget: {unknown_nodes}", file=sys.stderr)
         self._isolated, self._heads, self._tails = TplgGraph._build_leaves(map(self.node_name_in_graph, grouped_tplg.widget_list), self._forward_edges, self._backward_edges)
 
     def _node_name_in_graph_from_name(self, name: str) -> str:
@@ -949,10 +968,29 @@ class TplgGraph:
 
     def _display_edge_attr(self, edge: Container):
         attr = {}
-        if GroupedTplg.is_virtual_widget(self._nodes_dict[edge["source"]])\
-            or GroupedTplg.is_virtual_widget(self._nodes_dict[edge["sink"]]):
+        source_widget = self._nodes_dict.get(edge["source"])
+        sink_widget = self._nodes_dict.get(edge["sink"])
+        if source_widget is None or sink_widget is None:
+            return attr
+        if GroupedTplg.is_virtual_widget(source_widget) \
+            or GroupedTplg.is_virtual_widget(sink_widget):
             attr['style'] = "dotted"
             attr['color'] = 'blue'
+        return attr
+
+    def _display_unknown_node_attrs(self, name: str):
+        "Style graph-only nodes so missing widgets are visible in rendered graph."
+        attr = {
+            'shape': 'box',
+            'style': 'dashed',
+            'color': 'orangered3',
+            'fontcolor': 'orangered3',
+        }
+        if self._forward_edges[name] and self._backward_edges[name]:
+            kind = 'graph-only junction'
+        else:
+            kind = 'graph-only endpoint'
+        attr['label'] = f'<{name}<BR ALIGN="CENTER"/><SUB>{kind}</SUB>>'
         return attr
 
     def draw(self, outfile: str, outdir: str = '.', file_format: str = "png", live_view: bool = False):
@@ -978,6 +1016,8 @@ class TplgGraph:
         from tempfile import gettempdir
 
         graph = Digraph("Topology Graph", format=file_format)
+        for name in self._unknown_nodes:
+            graph.node(name, **self._display_unknown_node_attrs(name))
         for node in self._tplg.widget_list:
             name = self.node_name_in_graph(node)
             if name not in self._isolated: # skip isolated nodes.
@@ -1088,7 +1128,7 @@ class TplgGraph:
         acc = set()
         self._find_connected_node_recursively(self._forward_edges, node_name, name_predicate, acc)
         self._find_connected_node_recursively(self._backward_edges, node_name, name_predicate, acc)
-        return [self._nodes_dict[name] for name in acc]
+        return [self._nodes_dict[name] for name in acc if name in self._nodes_dict]
 
     def find_connected_comp(self, ref_node: Container, predicate) -> "list[Container]":
         r"""Find specified components connected to `ref_node`.
@@ -1127,7 +1167,7 @@ class TplgGraph:
         """
         return self._find_connected_comp(
             self.node_name_in_graph(ref_node),
-            lambda name: predicate(self._nodes_dict[name]))
+            lambda name: name in self._nodes_dict and predicate(self._nodes_dict[name]))
 
     def find_comp_for_pcm(self, pcm: Container, prefix: str) -> "list[list[Container]]":
         r"""Find specified components for PCM.
